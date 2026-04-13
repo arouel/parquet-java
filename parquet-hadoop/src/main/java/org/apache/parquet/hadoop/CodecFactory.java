@@ -39,6 +39,7 @@ import org.apache.parquet.bytes.BytesInput;
 import org.apache.parquet.compression.CompressionCodecFactory;
 import org.apache.parquet.conf.HadoopParquetConfiguration;
 import org.apache.parquet.conf.ParquetConfiguration;
+import org.apache.parquet.hadoop.codec.Lz4RawDecompressor;
 import org.apache.parquet.hadoop.codec.ZstandardCodec;
 import org.apache.parquet.hadoop.metadata.CompressionCodecName;
 import org.apache.parquet.hadoop.util.ConfigurationUtil;
@@ -164,10 +165,25 @@ public class CodecFactory implements CompressionCodecFactory {
 
     @Override
     public BytesInput decompress(BytesInput bytes, int decompressedSize) throws IOException {
-      final BytesInput decompressed;
       if (decompressor != null) {
         decompressor.reset();
       }
+
+      if (decompressor instanceof Lz4RawDecompressor) {
+        byte[] compressedBytes = bytes.toByteArray();
+        byte[] outputBytes = new byte[decompressedSize];
+        decompressor.setInput(compressedBytes, 0, compressedBytes.length);
+
+        int decompressedBytes = decompressor.decompress(outputBytes, 0, decompressedSize);
+        if (decompressedBytes != decompressedSize || !decompressor.finished()) {
+          throw new IOException("Corrupt file: expected " + decompressedSize + " uncompressed bytes but got "
+              + decompressedBytes + " for LZ4_RAW.");
+        }
+
+        return BytesInput.from(outputBytes);
+      }
+
+      final BytesInput decompressed;
       InputStream is = codec.createInputStream(bytes.toInputStream(), decompressor);
 
       // We need to explicitly close the ZstdDecompressorStream here to release the resources it holds to

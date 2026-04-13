@@ -236,6 +236,32 @@ public class TestDirectCodecFactory {
     }
   }
 
+  @Test
+  public void lz4RawHeapDecompressorCanCopyLargePage() throws IOException {
+    final int size = 16 * 1024;
+    final byte[] raw = new byte[size];
+    new Random(42).nextBytes(raw);
+
+    try (TrackingByteBufferAllocator allocator = TrackingByteBufferAllocator.wrap(new DirectByteBufferAllocator());
+        ByteBufferReleaser releaser = new ByteBufferReleaser(allocator)) {
+      CodecFactory heapCodecFactory = new CodecFactory(new Configuration(), pageSize);
+      BytesInputCompressor compressor = heapCodecFactory.getCompressor(LZ4_RAW);
+      BytesInputDecompressor decompressor = heapCodecFactory.getDecompressor(LZ4_RAW);
+
+      BytesInput compressed = compressor.compress(BytesInput.from(raw));
+      BytesInput decompressed = decompressor.decompress(compressed, size);
+
+      // Regression coverage: previously this copy path hit StreamBytesInput.writeInto(...),
+      // which reads via Channels.newChannel(...) in 8KB chunks and failed for LZ4_RAW.
+      BytesInput copied = decompressed.copy(releaser);
+      Assert.assertArrayEquals(raw, copied.toByteArray());
+
+      compressor.release();
+      decompressor.release();
+      heapCodecFactory.release();
+    }
+  }
+
   static class PublicCodecFactory extends CodecFactory {
     // To make getCodec public
 
