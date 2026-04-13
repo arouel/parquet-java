@@ -70,15 +70,9 @@ public abstract class NonBlockedDecompressor implements Decompressor {
       Preconditions.checkArgument(outputBuffer.position() == 0, "Invalid position of 0.");
       // There is compressed input, decompress it now.
       int decompressedSize = maxUncompressedLength(inputBuffer, len);
-      if (decompressedSize > outputBuffer.capacity()) {
-        ByteBuffer oldBuffer = outputBuffer;
-        outputBuffer = ByteBuffer.allocateDirect(decompressedSize);
-        CleanUtil.cleanDirectBuffer(oldBuffer);
-      }
+      ensureOutputBufferCapacity(decompressedSize);
 
-      // Reset the previous outputBuffer (i.e. set position to 0)
-      outputBuffer.clear();
-      int size = uncompress(inputBuffer, outputBuffer);
+      int size = uncompressWithExpandableOutputBuffer(decompressedSize);
       outputBuffer.limit(size);
       // We've decompressed the entire input, reset the input now
       inputBuffer.clear();
@@ -184,6 +178,20 @@ public abstract class NonBlockedDecompressor implements Decompressor {
   protected abstract int maxUncompressedLength(ByteBuffer compressed, int maxUncompressedLength) throws IOException;
 
   /**
+   * Computes a better output size estimate after a decompression error.
+   *
+   * @param compressed                    input data [pos() ... limit())
+   * @param currentMaxUncompressedLength  current output size estimate
+   * @param error                         decompression error that triggered this callback
+   * @return the next output size estimate; if no better estimate is available, return
+   *         {@code currentMaxUncompressedLength}
+   */
+  protected int maxUncompressedLengthOnDecompressionError(
+      ByteBuffer compressed, int currentMaxUncompressedLength, Throwable error) throws IOException {
+    return currentMaxUncompressedLength;
+  }
+
+  /**
    * Uncompress the content in the input buffer. The result is dumped to the
    * specified output buffer.
    *
@@ -192,4 +200,43 @@ public abstract class NonBlockedDecompressor implements Decompressor {
    * @return uncompressed data size
    */
   protected abstract int uncompress(ByteBuffer compressed, ByteBuffer uncompressed) throws IOException;
+
+  private int uncompressWithExpandableOutputBuffer(int initialUncompressedSize) throws IOException {
+    int estimatedUncompressedSize = initialUncompressedSize;
+    while (true) {
+      // Reset the previous outputBuffer (i.e. set position to 0)
+      outputBuffer.clear();
+      inputBuffer.rewind();
+      try {
+        return uncompress(inputBuffer, outputBuffer);
+      } catch (IOException | RuntimeException e) {
+        ByteBuffer compressed = inputBuffer.duplicate();
+        compressed.rewind();
+        int nextEstimate;
+        try {
+          nextEstimate = maxUncompressedLengthOnDecompressionError(compressed, estimatedUncompressedSize, e);
+        } catch (IOException | RuntimeException fallbackError) {
+          fallbackError.addSuppressed(e);
+          throw fallbackError;
+        }
+        if (nextEstimate > outputBuffer.capacity()) {
+          estimatedUncompressedSize = nextEstimate;
+          ensureOutputBufferCapacity(nextEstimate);
+          continue;
+        }
+        if (e instanceof IOException) {
+          throw (IOException) e;
+        }
+        throw e;
+      }
+    }
+  }
+
+  private void ensureOutputBufferCapacity(int requiredCapacity) {
+    if (requiredCapacity > outputBuffer.capacity()) {
+      ByteBuffer oldBuffer = outputBuffer;
+      outputBuffer = ByteBuffer.allocateDirect(requiredCapacity);
+      CleanUtil.cleanDirectBuffer(oldBuffer);
+    }
+  }
 }

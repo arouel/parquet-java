@@ -25,13 +25,69 @@ import org.apache.hadoop.io.compress.DirectDecompressor;
 
 public class Lz4RawDecompressor extends NonBlockedDecompressor implements DirectDecompressor {
 
-  private Lz4Decompressor decompressor = new Lz4Decompressor();
+  private static final int LENGTH_MASK = 0x0F;
+  private static final int MIN_MATCH_LENGTH = 4;
+  private static final int MIN_LAST_LITERAL_LENGTH_WITH_MATCH = 5;
+
+  private final Lz4Decompressor decompressor = new Lz4Decompressor();
 
   @Override
   protected int maxUncompressedLength(ByteBuffer compressed, int maxUncompressedLength) throws IOException {
-    // We cannot obtain the precise uncompressed length from the input data.
-    // Simply return the maxUncompressedLength.
-    return maxUncompressedLength;
+    return Math.max(maxUncompressedLength, compressed.remaining());
+  }
+
+  @Override
+  protected int maxUncompressedLengthOnDecompressionError(
+      ByteBuffer compressed, int currentMaxUncompressedLength, Throwable error) throws IOException {
+    return Math.max(currentMaxUncompressedLength, exactUncompressedLength(compressed));
+  }
+
+  private static int exactUncompressedLength(ByteBuffer compressed) throws IOException {
+    ByteBuffer input = compressed.duplicate();
+    long uncompressedLength = 0;
+    boolean sawMatch = false;
+
+    while (input.hasRemaining()) {
+      int token = input.get() & 0xFF;
+
+      long literalLength = token >>> 4;
+      literalLength = readLength(input, literalLength);
+      if (literalLength > input.remaining()) {
+        throw new IOException("Malformed LZ4 input: literal length exceeds remaining compressed input");
+      }
+      uncompressedLength = checkedAdd(uncompressedLength, literalLength);
+      input.position(input.position() + (int) literalLength);
+
+      if (!input.hasRemaining()) {
+        if (sawMatch && literalLength < MIN_LAST_LITERAL_LENGTH_WITH_MATCH) {
+          throw new IOException(
+              "Malformed LZ4 input: last literals must be at least " + MIN_LAST_LITERAL_LENGTH_WITH_MATCH
+                  + " bytes");
+        }
+        break;
+      }
+
+      if (input.remaining() < 2) {
+        throw new IOException("Malformed LZ4 input: missing match offset");
+      }
+
+      int offset = (input.get() & 0xFF) | ((input.get() & 0xFF) << 8);
+      if (offset == 0 || offset > uncompressedLength) {
+        throw new IOException("Malformed LZ4 input: invalid match offset " + offset);
+      }
+
+      long matchLength = token & LENGTH_MASK;
+      matchLength = readLength(input, matchLength);
+      matchLength = checkedAdd(matchLength, MIN_MATCH_LENGTH);
+      uncompressedLength = checkedAdd(uncompressedLength, matchLength);
+      sawMatch = true;
+
+      if (!input.hasRemaining()) {
+        throw new IOException("Malformed LZ4 input: missing trailing literals");
+      }
+    }
+
+    return (int) uncompressedLength;
   }
 
   @Override
@@ -46,5 +102,31 @@ public class Lz4RawDecompressor extends NonBlockedDecompressor implements Direct
   @Override
   public void decompress(ByteBuffer compressed, ByteBuffer uncompressed) throws IOException {
     uncompress(compressed, uncompressed);
+  }
+
+  private static long readLength(ByteBuffer input, long length) throws IOException {
+    if (length != LENGTH_MASK) {
+      return length;
+    }
+
+    while (true) {
+      if (!input.hasRemaining()) {
+        throw new IOException("Malformed LZ4 input: truncated length");
+      }
+
+      int value = input.get() & 0xFF;
+      length = checkedAdd(length, value);
+      if (value != 255) {
+        return length;
+      }
+    }
+  }
+
+  private static long checkedAdd(long left, long right) throws IOException {
+    long result = left + right;
+    if (result < left || result > Integer.MAX_VALUE) {
+      throw new IOException("LZ4 uncompressed length exceeds supported maximum: " + result);
+    }
+    return result;
   }
 }
